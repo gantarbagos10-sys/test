@@ -173,7 +173,7 @@ const N=10;
 const clients=Array.from({length:N},()=>({ws:null,loggedIn:false,inRoom:false,pingTimer:null,intentionalClose:false,balance:null}));
 const rows=document.getElementById("rows"),roomEl=document.getElementById("room"),userList=document.getElementById("userList"),targetList=document.getElementById("targetList"),userCount=document.getElementById("userCount"),targetCount=document.getElementById("targetCount"),saveLoadEl=document.getElementById("saveLoad");
 const kickProgressStatus=document.getElementById("kickProgressStatus"),kickProgressDetail=document.getElementById("kickProgressDetail"),kickDispatched=document.getElementById("kickDispatched"),kickFailed=document.getElementById("kickFailed"),kickWs=document.getElementById("kickWs"),kickRate=document.getElementById("kickRate"),kickSocketReports=document.getElementById("kickSocketReports");
-let kickProgressJobs=new Map();let kickProgressSeen=new Set();let kickProgressStartedAt=0;
+let kickProgressJobs=new Map();let kickProgressSeen=new Set();let kickProgressStartedAt=0;let confirmedKickedTargets=new Set();
 const SAVE_PREFIX="migsock_config_";
 let participantUsers=[];
 const COUNTDOWN_DEFAULT=60000;
@@ -310,7 +310,18 @@ function getRange(){
 function refreshUserList(){}
 function updateTargetCount(){targetCount.textContent=targetList.querySelectorAll(".target-item").length}
 function targetHas(username){return [...targetList.querySelectorAll(".target-item")].some(o=>o.dataset.username===username)}
-function addTarget(username){if(!username||targetHas(username)||targetList.querySelectorAll(".target-item").length>=10)return;const e=document.createElement("div");e.className="target-item";e.dataset.username=username;e.textContent=username;targetList.appendChild(e);updateTargetCount()}
+function removeConfirmedKickedTarget(username){
+  username=String(username||"").trim();
+  if(username)confirmedKickedTargets.add(username.toLowerCase());
+  if(!username)return;
+  const match=[...targetList.querySelectorAll(".target-item")].find(o=>String(o.dataset.username||"").toLowerCase()===username.toLowerCase());
+  if(!match)return;
+  match.remove();
+  updateTargetCount();
+  if(Array.isArray(participantUsers) && participantUsers.length) showUsers(participantUsers,false);
+  log(0,`TARGET dihapus otomatis: ${username} sudah kicked — target tidak akan diproses lagi`);
+}
+function addTarget(username){if(!username||confirmedKickedTargets.has(String(username).trim().toLowerCase())||targetHas(username)||targetList.querySelectorAll(".target-item").length>=10)return;const e=document.createElement("div");e.className="target-item";e.dataset.username=username;e.textContent=username;targetList.appendChild(e);updateTargetCount()}
 function moveUserToTarget(username,row){addTarget(username);if(row&&row.parentNode)row.parentNode.removeChild(row);userCount.textContent=userList.querySelectorAll(".user-item").length}
 function autoAddMatchingTargets(users){
   const blockedWsUsers=new Set();
@@ -318,7 +329,7 @@ function autoAddMatchingTargets(users){
     const u=cred(i).username;
     if(u)blockedWsUsers.add(u.toLowerCase());
   }
-  const list=[...new Set((users||[]).filter(Boolean).map(String))].filter(u=>!blockedWsUsers.has(u.toLowerCase()));
+  const list=[...new Set((users||[]).filter(Boolean).map(String))].filter(u=>!blockedWsUsers.has(u.toLowerCase())&&!confirmedKickedTargets.has(u.toLowerCase()));
   const groups=new Map();
   const addGroup=(key,item,type)=>{if(!groups.has(key))groups.set(key,{type,items:[]});groups.get(key).items.push(item)};
   list.forEach(u=>{
@@ -356,7 +367,7 @@ function autoAddMatchingTargets(users){
   return selected.map(x=>x.u);
 }
 function clearTargets(){
-  const restored=[...new Set(participantUsers)];
+  const restored=[...new Set(participantUsers)].filter(u=>!confirmedKickedTargets.has(String(u).toLowerCase()));
   targetList.innerHTML="";
   updateTargetCount();
   if(restored.length) showUsers(restored,false); else { userList.innerHTML=""; userCount.textContent="0"; }
@@ -434,7 +445,7 @@ function handleParticipants(m,i){
   return true;
 }
 // Patch each socket handler to also process room participant results.
-function loginOne(i){const c=clients[i],x=cred(i);if(!x.username||!x.password){log(i,"Username/password kosong");return}c.intentionalClose=false;c.loggedIn=false;c.inRoom=false;c.balance=null;setBalance(i,"—");stopPing(i);if(c.ws)try{c.ws.close()}catch(e){}status(i,"CONNECTING","connecting");log(i,"Connecting local proxy...");const ws=new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);c.ws=ws;ws.onopen=()=>log(i,"Proxy OPEN; menunggu auth.required");ws.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch(_){log(i,"RECV non-JSON");return}updateBalanceFromMessage(i,m);if(m.type==="kick.progress"){handleKickProgress(m);return}if(m.type==="proxy.error"){status(i,"PROXY ERROR","error");log(i,"PROXY ERROR: "+(m.data?.message||"unknown"));return}if(m.type==="kick.progress"){handleKickProgress(m);return}if(isKickEvent(m)){maybeSuicide(m);startCountdownFromKick(m)}if(handleParticipants(m,i))return;if(m.type==="auth.required"){log(i,"RECV auth.required");send(i,{type:"developer.login",username:x.username,password:x.password},true)}else if(m.type==="session.ready"){c.loggedIn=true;c.inRoom=false;status(i,"ONLINE","online");startPing(i);log(i,"LOGIN OK")}else if(m.type==="room.join.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.joined===true||m.success===true;if(ok){c.inRoom=true;log(i,"ENTER ROOM OK");const r=roomEl.value.trim();if(r)send(i,{type:"room.participants",room:r},true)}else log(i,"ENTER ROOM RESULT "+JSON.stringify(m))}else if(m.type==="room.leave.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.left===true||m.success===true;if(ok){c.inRoom=false;log(i,"LEAVE ROOM OK")}else log(i,"LEAVE ROOM RESULT "+JSON.stringify(m))}else if(m.type==="session.replaced"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"REPLACED","error")}else if(m.type==="error"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"ERROR","error");log(i,"API ERROR "+JSON.stringify(m))}};ws.onerror=()=>{status(i,"ERROR","error");log(i,"Local WebSocket proxy error")};ws.onclose=e=>{stopPing(i);c.loggedIn=false;c.inRoom=false;if(!c.intentionalClose)status(i,"CLOSED","offline");log(i,`CLOSED code=${e.code} reason=${e.reason||"-"}`)}};
+function loginOne(i){const c=clients[i],x=cred(i);if(!x.username||!x.password){log(i,"Username/password kosong");return}c.intentionalClose=false;c.loggedIn=false;c.inRoom=false;c.balance=null;setBalance(i,"—");stopPing(i);if(c.ws)try{c.ws.close()}catch(e){}status(i,"CONNECTING","connecting");log(i,"Connecting local proxy...");const ws=new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);c.ws=ws;ws.onopen=()=>log(i,"Proxy OPEN; menunggu auth.required");ws.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch(_){log(i,"RECV non-JSON");return}updateBalanceFromMessage(i,m);if(m.type==="kick.target.confirmed"){removeConfirmedKickedTarget(m.target_username);return}if(m.type==="kick.progress"){handleKickProgress(m);return}if(m.type==="proxy.error"){status(i,"PROXY ERROR","error");log(i,"PROXY ERROR: "+(m.data?.message||"unknown"));return}if(isKickEvent(m)){maybeSuicide(m);startCountdownFromKick(m)}if(handleParticipants(m,i))return;if(m.type==="auth.required"){log(i,"RECV auth.required");send(i,{type:"developer.login",username:x.username,password:x.password},true)}else if(m.type==="session.ready"){c.loggedIn=true;c.inRoom=false;status(i,"ONLINE","online");startPing(i);log(i,"LOGIN OK")}else if(m.type==="room.join.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.joined===true||m.success===true;if(ok){c.inRoom=true;log(i,"ENTER ROOM OK");const r=roomEl.value.trim();if(r)send(i,{type:"room.participants",room:r},true)}else log(i,"ENTER ROOM RESULT "+JSON.stringify(m))}else if(m.type==="room.leave.result"){const ok=m.ok===true||m.data?.ok===true||m.data?.left===true||m.success===true;if(ok){c.inRoom=false;log(i,"LEAVE ROOM OK")}else log(i,"LEAVE ROOM RESULT "+JSON.stringify(m))}else if(m.type==="session.replaced"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"REPLACED","error")}else if(m.type==="error"){c.loggedIn=false;c.inRoom=false;stopPing(i);status(i,"ERROR","error");log(i,"API ERROR "+JSON.stringify(m))}};ws.onerror=()=>{status(i,"ERROR","error");log(i,"Local WebSocket proxy error")};ws.onclose=e=>{stopPing(i);c.loggedIn=false;c.inRoom=false;if(!c.intentionalClose)status(i,"CLOSED","offline");log(i,`CLOSED code=${e.code} reason=${e.reason||"-"}`)}};
 function syncBruteCombo(source){
   const brute=document.getElementById('burstKick');
   const combo=document.getElementById('comboKick');
