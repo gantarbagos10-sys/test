@@ -176,6 +176,8 @@ const kickProgressStatus=document.getElementById("kickProgressStatus"),kickProgr
 let kickProgressJobs=new Map();let kickProgressSeen=new Set();let kickProgressStartedAt=0;let confirmedKickedTargets=new Set();
 const SAVE_PREFIX="migsock_config_";
 let participantUsers=[];
+const participantBySocket=Array.from({length:N},()=>[]);
+let autoTargetLocked=false;
 const COUNTDOWN_DEFAULT=60000;
 let countdownDeadline=0;
 let countdownTimer=null;
@@ -309,66 +311,200 @@ function getRange(){
 }
 function refreshUserList(){}
 function updateTargetCount(){targetCount.textContent=targetList.querySelectorAll(".target-item").length}
-function targetHas(username){return [...targetList.querySelectorAll(".target-item")].some(o=>o.dataset.username===username)}
+function targetHas(username){
+  const key=String(username||"").trim().toLowerCase();
+  return !!key && [...targetList.querySelectorAll(".target-item")].some(o=>String(o.dataset.username||"").trim().toLowerCase()===key);
+}
 function removeConfirmedKickedTarget(username){
   username=String(username||"").trim();
-  if(username)confirmedKickedTargets.add(username.toLowerCase());
-  if(!username)return;
-  const match=[...targetList.querySelectorAll(".target-item")].find(o=>String(o.dataset.username||"").toLowerCase()===username.toLowerCase());
-  if(!match)return;
-  match.remove();
+  if(!username)return false;
+  const key=username.toLowerCase();
+  confirmedKickedTargets.add(key);
+
+  // Hapus dari TARGET jika masih ada.
+  [...targetList.querySelectorAll(".target-item")]
+    .filter(o=>String(o.dataset.username||"").trim().toLowerCase()===key)
+    .forEach(o=>o.remove());
+
+  // Hapus dari seluruh snapshot participant agar refresh WS berikutnya
+  // tidak menghidupkan kembali username yang sudah confirmed kicked.
+  participantUsers=(participantUsers||[]).filter(u=>String(u||"").trim().toLowerCase()!==key);
+  if(Array.isArray(participantBySocket)){
+    participantBySocket=participantBySocket.map(list=>
+      (Array.isArray(list)?list:[]).filter(u=>String(u||"").trim().toLowerCase()!==key)
+    );
+  }
+
+  // Hapus langsung dari LIST USER. Jika render ulang diperlukan, render dari
+  // snapshot yang sudah dibersihkan sehingga username kicked tidak kembali.
+  [...userList.querySelectorAll(".user-item")].forEach(row=>{
+    const label=row.querySelector("span");
+    if(label && label.textContent.trim().toLowerCase()===key)row.remove();
+  });
+
   updateTargetCount();
-  if(Array.isArray(participantUsers) && participantUsers.length) showUsers(participantUsers,false);
-  log(0,`TARGET dihapus otomatis: ${username} sudah kicked — target tidak akan diproses lagi`);
+  const visible=[...userList.querySelectorAll(".user-item")].length;
+  const empty=userList.querySelector(".empty");
+  if(empty && visible)empty.remove();
+  userCount.textContent=String(visible);
+  log(0,`KICKED: ${username} dihapus dari USER dan TARGET`);
+  return true;
 }
-function addTarget(username){if(!username||confirmedKickedTargets.has(String(username).trim().toLowerCase())||targetHas(username)||targetList.querySelectorAll(".target-item").length>=10)return;const e=document.createElement("div");e.className="target-item";e.dataset.username=username;e.textContent=username;targetList.appendChild(e);updateTargetCount()}
-function moveUserToTarget(username,row){addTarget(username);if(row&&row.parentNode)row.parentNode.removeChild(row);userCount.textContent=userList.querySelectorAll(".user-item").length}
+function addTarget(username){
+  const value=String(username||"").trim();
+  if(!value)return false;
+  const key=value.toLowerCase();
+  const ownWs=new Set();
+  for(let i=0;i<N;i++){const u=cred(i).username;if(u)ownWs.add(u.trim().toLowerCase());}
+  if(ownWs.has(key)||confirmedKickedTargets.has(key)||targetHas(value)||targetList.querySelectorAll(".target-item").length>=10)return false;
+  const e=document.createElement("div");
+  e.className="target-item";
+  e.dataset.username=value;
+  e.textContent=value;
+  targetList.appendChild(e);
+  updateTargetCount();
+  return true;
+}
+function moveUserToTarget(username,row,checkbox){
+  const added=addTarget(username);
+  if(added){
+    if(row&&row.parentNode)row.parentNode.removeChild(row);
+    userCount.textContent=userList.querySelectorAll(".user-item").length;
+  }else if(checkbox){
+    checkbox.checked=false;
+  }
+}
 function autoAddMatchingTargets(users){
   const blockedWsUsers=new Set();
   for(let i=0;i<N;i++){
     const u=cred(i).username;
-    if(u)blockedWsUsers.add(u.toLowerCase());
+    if(u)blockedWsUsers.add(u.trim().toLowerCase());
   }
-  const list=[...new Set((users||[]).filter(Boolean).map(String))].filter(u=>!blockedWsUsers.has(u.toLowerCase())&&!confirmedKickedTargets.has(u.toLowerCase()));
-  const groups=new Map();
-  const addGroup=(key,item,type)=>{if(!groups.has(key))groups.set(key,{type,items:[]});groups.get(key).items.push(item)};
-  list.forEach(u=>{
+
+  const list=[...new Map((users||[])
+    .map(x=>String(x||'').trim())
+    .filter(Boolean)
+    .map(u=>[u.toLowerCase(),u])).values()]
+    .filter(u=>!blockedWsUsers.has(u.toLowerCase())&&!confirmedKickedTargets.has(u.toLowerCase()));
+
+  // A pattern is a family with the same prefix/suffix and a numbered or
+  // alphabetic sequence in the middle/end. Plain base names are deliberately
+  // not mixed with their numbered variants.
+  const numericGroups=new Map();
+  const alphaGroups=new Map();
+  const add=(map,key,item)=>{if(!map.has(key))map.set(key,[]);map.get(key).push(item)};
+
+  for(const u of list){
     let m=u.match(/^(.*?)(\d+)(.*?)$/);
-    if(m){addGroup(`num|${m[1].toLowerCase()}|${m[3].toLowerCase()}`,{u,n:Number(m[2]),width:m[2].length},"num");return}
+    if(m){
+      add(numericGroups,`${m[1].toLowerCase()}|${m[3].toLowerCase()}`,{
+        u,n:Number(m[2]),raw:m[2],width:m[2].length,prefix:m[1],suffix:m[3]
+      });
+      continue;
+    }
     m=u.match(/^(.*?)([A-Za-z])$/);
-    if(m)addGroup(`alpha|${m[1].toLowerCase()}`,{u,ch:m[2].toLowerCase()},"alpha");
-  });
-  const candidates=[];
-  for(const g of groups.values()){
-    const items=g.items;
-    if(items.length<2)continue;
-    if(g.type==="num"){
-      const sorted=[...items].sort((a,b)=>a.n-b.n||a.u.localeCompare(b.u));
-      const nums=[...new Set(sorted.map(x=>x.n))];
-      let run=1,bestRun=1;
-      for(let i=1;i<nums.length;i++){run=nums[i]===nums[i-1]+1?run+1:1;bestRun=Math.max(bestRun,run)}
-      const preferred=sorted.filter(x=>x.n>=1&&x.n<=10);
-      const seq=preferred.length>=2?preferred:sorted;
-      const isWs=/^ws$/i.test((g.items[0].u.match(/^(.*?)\d+.*$/)||[])[1]||"");
-      candidates.push({items:seq,score:1000+(bestRun*20)+(preferred.length*10)+Math.min(items.length,10)*2-(isWs?300:0),type:g.type});
-    }else{
-      const sorted=[...items].sort((a,b)=>a.ch.charCodeAt(0)-b.ch.charCodeAt(0)||a.u.localeCompare(b.u));
-      const distinct=[...new Set(sorted.map(x=>x.ch))];
-      let run=1,bestRun=1;
-      for(let i=1;i<distinct.length;i++){run=distinct[i].charCodeAt(0)===distinct[i-1].charCodeAt(0)+1?run+1:1;bestRun=Math.max(bestRun,run)}
-      candidates.push({items:sorted,score:700+(bestRun*20)+Math.min(items.length,10)*2,type:g.type});
+    if(m){
+      add(alphaGroups,m[1].toLowerCase(),{u,ch:m[2].toLowerCase(),code:m[2].toLowerCase().charCodeAt(0),prefix:m[1]});
     }
   }
+
+  const candidates=[];
+
+  // Numeric patterns: use a sliding window of at most 10 consecutive numbers.
+  // This handles target.00-target.99, target.01-target.99, manda01-manda10,
+  // and prefixes/suffixes such as name01.man without treating plain `name`
+  // as part of the numbered pattern.
+  for(const [key,rawItems] of numericGroups){
+    const byNumber=new Map();
+    for(const x of rawItems){
+      const old=byNumber.get(x.n);
+      if(!old || x.width>old.width || x.u.localeCompare(old.u)<0)byNumber.set(x.n,x);
+    }
+    const items=[...byNumber.values()].sort((a,b)=>a.n-b.n||a.u.localeCompare(b.u));
+    if(items.length<2)continue;
+
+    let best=null;
+    for(let i=0;i<items.length;i++){
+      const window=[];
+      for(let j=i;j<items.length && items[j].n-items[i].n<10;j++)window.push(items[j]);
+      if(!window.length)continue;
+      let contiguous=1;
+      for(let k=1;k<window.length;k++){
+        if(window[k].n===window[k-1].n+1)contiguous++;
+        else break;
+      }
+      const sameWidth=window.filter(x=>x.width===window[0].width).length;
+      const score={count:window.length,contiguous,start:window[0].n,sameWidth,width:window[0].width};
+      if(!best || score.contiguous>best.score.contiguous ||
+        (score.contiguous===best.score.contiguous && score.count>best.score.count) ||
+        (score.contiguous===best.score.contiguous && score.count===best.score.count && score.sameWidth>best.score.sameWidth) ||
+        (score.contiguous===best.score.contiguous && score.count===best.score.count && score.sameWidth===best.score.sameWidth && score.start<best.score.start)){
+        best={window,score};
+      }
+    }
+    if(!best)continue;
+
+    const selected=best.window.slice(0,10);
+    // A full 10-member contiguous sequence is the strongest numeric pattern.
+    // If fewer than 10 exist in the best window, do not fill it with unrelated
+    // numbers: the remaining slots stay available for manual checkbox target.
+    const contiguousCount=Math.min(best.score.contiguous,10);
+    candidates.push({
+      items:selected.slice(0,contiguousCount),
+      score:3000 + contiguousCount*100 + Math.min(best.score.count,10)*10 + best.score.sameWidth - Math.min(best.score.start,999999)/1000000,
+      type:'num',
+      start:best.score.start,
+      key
+    });
+  }
+
+  // Alphabetic patterns: find the best contiguous run/window, e.g.
+  // abcd.a-abcd.j. Do not simply sort and take the first 10 letters.
+  for(const [key,rawItems] of alphaGroups){
+    const byCode=new Map();
+    for(const x of rawItems){
+      if(!byCode.has(x.code))byCode.set(x.code,x);
+    }
+    const items=[...byCode.values()].sort((a,b)=>a.code-b.code||a.u.localeCompare(b.u));
+    if(items.length<2)continue;
+
+    let best=null;
+    for(let i=0;i<items.length;i++){
+      const window=[];
+      for(let j=i;j<items.length && items[j].code-items[i].code<10;j++)window.push(items[j]);
+      let contiguous=window.length?1:0;
+      for(let k=1;k<window.length;k++){
+        if(window[k].code===window[k-1].code+1)contiguous++;
+        else break;
+      }
+      const score={count:window.length,contiguous,start:window[0]?.code||999,sameCase:window.filter(x=>x.ch===window[0]?.ch).length};
+      if(!best || score.contiguous>best.score.contiguous ||
+        (score.contiguous===best.score.contiguous && score.count>best.score.count) ||
+        (score.contiguous===best.score.contiguous && score.count===best.score.count && score.start<best.score.start))best={window,score};
+    }
+    if(!best || best.score.contiguous<2)continue;
+    const selected=best.window.slice(0,10);
+    candidates.push({items:selected,score:2000+selected.length*100+Math.min(best.score.count,10)*10-best.score.start/100000,type:'alpha',start:best.score.start,key});
+  }
+
+  // Numeric sequence always has priority over alphabetic sequence when both
+  // have comparable length. Within the same type, longest contiguous run wins;
+  // ties prefer the earliest sequence. This makes target.00-target.09 beat
+  // target.01-target.10 when both are available.
   candidates.sort((a,b)=>b.score-a.score);
   const best=candidates[0];
   if(!best)return [];
-  const selected=best.items.slice(0,Math.max(0,10-targetList.querySelectorAll(".target-item").length));
-  selected.forEach(x=>addTarget(x.u));
-  return selected.map(x=>x.u);
+
+  const capacity=Math.max(0,10-targetList.querySelectorAll('.target-item').length);
+  if(!capacity)return [];
+  const added=[];
+  for(const x of best.items.slice(0,capacity))if(addTarget(x.u))added.push(x.u);
+  return added;
 }
 function clearTargets(){
   const restored=[...new Set(participantUsers)].filter(u=>!confirmedKickedTargets.has(String(u).toLowerCase()));
   targetList.innerHTML="";
+  autoTargetLocked=false;
   updateTargetCount();
   if(restored.length) showUsers(restored,false); else { userList.innerHTML=""; userCount.textContent="0"; }
   log(0,`TARGET dihapus: ${restored.length} username dikembalikan ke USER`);
@@ -415,33 +551,64 @@ function extractUsers(m){
   return arr.map(x=>typeof x==='string'?x:(x?.username??x?.user??x?.name??x?.nickname??x?.id??"" )).filter(Boolean);
 }
 function showUsers(users,auto=true){
-  participantUsers=[...new Set((users||[]).filter(Boolean))];
+  const uniq=[...new Map((users||[])
+    .map(x=>String(x||'').trim())
+    .filter(Boolean)
+    .map(u=>[u.toLowerCase(),u])).values()];
+  participantUsers=uniq;
   userList.innerHTML="";
-  const uniq=[...new Set((users||[]).filter(Boolean))];
-  const autoTargets=auto?autoAddMatchingTargets(uniq):[];
-  if(autoTargets.length)log(0,`AUTO TARGET: ${autoTargets.join(", ")}`);
-  const visible=uniq.filter(u=>!targetHas(u));
+
+  // Auto Target is intentionally locked after the first successful selection
+  // for the current List User cycle. Later WS participant responses only
+  // refresh the User list and cannot replace the chosen pattern.
+  const autoTargets=(!autoTargetLocked&&auto)?autoAddMatchingTargets(uniq):[];
+  if(autoTargets.length){
+    autoTargetLocked=true;
+    log(0,`AUTO TARGET: ${autoTargets.join(", ")}`);
+  }
+
+  const visible=uniq.filter(u=>!targetHas(u)&&!confirmedKickedTargets.has(u.toLowerCase()));
   if(!visible.length){
-    const e=document.createElement("div");e.className="empty";e.textContent=uniq.length?"Semua participant sudah dipindahkan ke TARGET":"Tidak ada participant";userList.appendChild(e);
+    const e=document.createElement("div");e.className="empty";
+    e.textContent=uniq.length?"Semua participant sudah dipindahkan ke TARGET":"Tidak ada participant";
+    userList.appendChild(e);
   }else{
     visible.forEach(u=>{
       const e=document.createElement("div");e.className="user-item";
       const cb=document.createElement("input");cb.type="checkbox";cb.className="user-check";cb.title="Pindahkan ke TARGET";
       const label=document.createElement("span");label.textContent=u;
-      cb.onchange=()=>{if(cb.checked)moveUserToTarget(u,e)};
+      cb.onchange=()=>{if(cb.checked)moveUserToTarget(u,e,cb)};
       e.append(cb,label);userList.appendChild(e);
     });
   }
   userCount.textContent=visible.length;
   updateTargetCount();
 }
-function listUser(){const room=getRoom();if(!room)return;targetList.innerHTML="";updateTargetCount();userList.innerHTML="";userCount.textContent="0";log(0,"LISTUSER: TARGET dikosongkan terlebih dahulu");let sent=0;for(let i=0;i<N;i++)if(clients[i].loggedIn){if(send(i,{type:"room.participants",room},true))sent++}if(!sent)return; }
+function listUser(){
+  const room=getRoom();if(!room)return;
+  targetList.innerHTML="";
+  userList.innerHTML="";
+  userCount.textContent="0";
+  autoTargetLocked=false;
+  participantUsers=[];
+  for(let i=0;i<N;i++)participantBySocket[i]=[];
+  updateTargetCount();
+  log(0,"LISTUSER: TARGET dan snapshot participant dikosongkan");
+  let sent=0;
+  for(let i=0;i<N;i++)if(clients[i].loggedIn){if(send(i,{type:"room.participants",room},true))sent++}
+  if(!sent)return;
+}
 function listRoom(){listUser()}
 function handleParticipants(m,i){
   if(m.type!=="room.participants.result"&&m.type!=="room.participants")return false;
   const users=extractUsers(m);
-  showUsers(users);
-  log(i,`LISTROOM: ${users.length} user`);
+  participantBySocket[i]=users;
+  const merged=[...new Map(participantBySocket.flat()
+    .map(x=>String(x||'').trim())
+    .filter(Boolean)
+    .map(u=>[u.toLowerCase(),u])).values()];
+  showUsers(merged);
+  log(i,`LISTROOM: WS${i+1} ${users.length} user | gabungan ${merged.length}`);
   return true;
 }
 // Patch each socket handler to also process room participant results.
