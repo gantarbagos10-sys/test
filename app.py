@@ -18,9 +18,86 @@ KICK_RATE_STATE = {}
 SUICIDE_KEYS = set()
 BROWSER_CLIENTS = set()
 
-# Server-authoritative kick limit: maximum 100 kick messages per upstream
-# WebSocket in each 1-second window. This is shared by KICK ALL and SUICIDE.
-KICK_MAX_PER_SECOND = 100
+# Active KICK ALL jobs grouped by room. Each job tracks targets that have
+# already been confirmed kicked by an upstream room event.
+ACTIVE_KICK_JOBS = {}
+
+def _norm_room_key(room):
+    return str(room or "").strip().casefold()
+
+def _event_payload_dict(payload):
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+def _kick_event_info(payload):
+    data = _event_payload_dict(payload)
+    typ = str(payload.get("type", data.get("type", data.get("event_type", "")))).strip().lower()
+    room = str(payload.get("room", data.get("room", ""))).strip()
+    target = str(payload.get("target_username", data.get("target_username", data.get("username", data.get("target", ""))))).strip()
+    status = str(payload.get("status_message", data.get("status_message", data.get("message", "")))).strip().lower()
+    return typ, room, target, status
+
+def _is_confirmed_kicked_event(payload):
+    typ, room, target, status = _kick_event_info(payload)
+    if not target:
+        return False
+    exact = {
+        "room.participant.kicked", "room.member.kicked", "room.user.kicked",
+        "participant.kicked", "member.kicked", "user.kicked",
+    }
+    if typ in exact:
+        return True
+    if "vote" in typ or typ in {"room.kick.result", "room.command.result"}:
+        return False
+    return any(x in status for x in (
+        "has been kicked", "was kicked", "have been kicked", "kicked from the room"
+    ))
+
+async def mark_confirmed_kick(payload):
+    if not _is_confirmed_kicked_event(payload):
+        return None
+    typ, room, target, status = _kick_event_info(payload)
+    room_key = _norm_room_key(room)
+    if not room_key or not target:
+        return None
+    target_key = target.casefold()
+    jobs = ACTIVE_KICK_JOBS.get(room_key, [])
+    newly_marked = False
+    for state in list(jobs):
+        if not isinstance(state, dict):
+            continue
+        lock = state.get("lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            state["lock"] = lock
+        async with lock:
+            # Only targets belonging to this job's immutable original pool
+            # can affect its replacement chain.
+            events = state.get("events", {})
+            if target_key not in events:
+                continue
+            kicked_targets = state.setdefault("kicked", set())
+            if target_key not in kicked_targets:
+                kicked_targets.add(target_key)
+                events[target_key].set()
+                newly_marked = True
+                callback = state.get("on_kicked")
+                if callback is not None:
+                    task = asyncio.create_task(callback(target))
+                    tasks = state.setdefault("replacement_tasks", set())
+                    tasks.add(task)
+                    task.add_done_callback(tasks.discard)
+    if newly_marked:
+        print(f"[KICK EVENT] confirmed kicked room={room!r} target={target!r} type={typ}", flush=True)
+    return {"room": room, "target": target, "type": typ}
+
+
+# Server-authoritative kick limit: 200 kicks/second per upstream WebSocket.
+# Defined directly in app.py so every kick path uses the same limit.
+KICK_MAX_PER_SECOND = 200
+KICK_LIMIT_LABEL = f"{KICK_MAX_PER_SECOND}/socket/second"
 
 DOWNLOAD_DIRS = [
     Path.home() / "storage" / "downloads",
@@ -29,6 +106,8 @@ DOWNLOAD_DIRS = [
     Path.home() / "Downloads",
     Path(__file__).resolve().parent / "configs",
 ]
+
+
 
 def safe_config_filename(name):
     name = str(name or "").strip()
@@ -122,7 +201,7 @@ async def send_upstream(ws, payload):
         return True
 
 async def send_kick(ws, room, target):
-    """Send one room.kick while enforcing 100 kicks/socket/second.
+    """Send one room.kick while enforcing the configured per-socket rate.
 
     The limiter is per upstream WebSocket and shared by all callers, so
     concurrent KICK ALL requests and SUICIDE cannot bypass the limit.
@@ -157,7 +236,18 @@ async def sandbox_kick(request):
         data = await request.json()
     except Exception:
         return web.json_response({"ok": False, "error": "JSON tidak valid"}, status=400)
-    targets = [str(x).strip() for x in data.get("targets", []) if str(x).strip()][:10]
+    targets = []
+    seen_targets = set()
+    for raw in data.get("targets", []):
+        target = str(raw).strip()
+        key = target.casefold()
+        if target and key not in seen_targets:
+            seen_targets.add(key)
+            targets.append(target)
+        if len(targets) >= 10:
+            break
+    ws_usernames = {str(name).strip().casefold() for name in ACTIVE_UPSTREAM if str(name).strip()}
+    targets = [t for t in targets if t.casefold() not in ws_usernames][:10]
     try:
         loops = max(1, min(100, int(data.get("loop", 1))))
         sockets_count = max(1, min(10, int(data.get("sockets", 10))))
@@ -298,38 +388,101 @@ async def kick_loop(request):
     progress = {"jobId": job_id, "phase": "started", "totalJobs": total_jobs,
                 "dispatchedJobs": 0, "failedJobs": 0, "websockets": len(sockets),
                 "targets": len(targets), "loop": loops, "burst": burst, "combo": combo,
-                "kickLimit": "100/socket/second", "socketReports": socket_reports()}
+                "kickLimit": KICK_LIMIT_LABEL, "socketReports": socket_reports()}
     await publish_kick_progress(progress)
 
     total = 0
     failed = 0
     progress_lock = asyncio.Lock()
 
-    async def run_one(ws, ws_name, target, loop_no):
+    room_key = _norm_room_key(room)
+    # Immutable replacement source: exactly the original target pool (max 10).
+    # BRUTE/COMBO still decide the normal dispatch pattern; replacement only
+    # reacts to a confirmed kicked event and never creates a new target.
+    replacement_state = {
+        "targets": list(targets),
+        "kicked": set(),
+        "claimed": set(),
+        "events": {t.casefold(): asyncio.Event() for t in targets},
+        "replacement_tasks": set(),
+        "replacement_dispatched": 0,
+        "lock": asyncio.Lock(),
+    }
+
+    async def dispatch_replacement(kicked_target):
+        async with replacement_state["lock"]:
+            kicked_key = str(kicked_target).strip().casefold()
+            candidates = [
+                t for t in replacement_state["targets"]
+                if t.casefold() not in replacement_state["kicked"]
+                and t.casefold() != kicked_key
+                and t.casefold() not in replacement_state["claimed"]
+            ]
+            if not candidates:
+                return
+            replacement = candidates[0]
+            replacement_state["claimed"].add(replacement.casefold())
+            replacement_state["replacement_dispatched"] += len(socket_entries)
+
+        if delay_target:
+            await asyncio.sleep(delay_target)
+
+        # Replacement uses the same active WS set as the selected BRUTE/COMBO
+        # job. It does not introduce another brute/combo pattern.
+        jobs = [
+            run_one(ws, ws_name, replacement, 0, is_replacement=True)
+            for ws_name, ws in socket_entries
+        ]
+        await asyncio.gather(*jobs, return_exceptions=True)
+
+    replacement_state["on_kicked"] = dispatch_replacement
+    ACTIVE_KICK_JOBS.setdefault(room_key, []).append(replacement_state)
+
+    async def run_one(ws, ws_name, target, loop_no, is_replacement=False):
         nonlocal total, failed
-        try:
-            result = await send_kick(ws, room, target)
-        except Exception:
-            result = False
-        async with progress_lock:
-            if result is True:
-                total += 1
-                socket_stats[ws_name]["dispatchedJobs"] += 1
-            else:
-                failed += 1
-                socket_stats[ws_name]["failedJobs"] += 1
-            socket_stats[ws_name]["lastTarget"] = target
-            socket_stats[ws_name]["lastLoop"] = loop_no + 1
-            current_total, current_failed = total, failed
-            current_socket = dict(socket_stats[ws_name])
-        await publish_kick_progress({
-            "jobId": job_id, "phase": "progress",
-            "totalJobs": total_jobs, "dispatchedJobs": current_total,
-            "failedJobs": current_failed, "websockets": len(sockets),
-            "loop": loop_no + 1, "loops": loops,
-            "target": target, "websocket": ws_name,
-            "socketStats": {"websocket": ws_name, **current_socket},
-        })
+        current_target = target
+
+        while current_target:
+            target_key = str(current_target).strip().casefold()
+
+            # Never send another kick to a target already confirmed as kicked.
+            state = replacement_state
+            async with state["lock"]:
+                if target_key in state["kicked"]:
+                    return
+
+            try:
+                result = await send_kick(ws, room, current_target)
+            except Exception:
+                result = False
+
+            async with progress_lock:
+                if result is True:
+                    total += 1
+                    socket_stats[ws_name]["dispatchedJobs"] += 1
+                else:
+                    failed += 1
+                    socket_stats[ws_name]["failedJobs"] += 1
+                socket_stats[ws_name]["lastTarget"] = current_target
+                socket_stats[ws_name]["lastLoop"] = loop_no + 1
+                current_total, current_failed = total, failed
+                current_socket = dict(socket_stats[ws_name])
+
+            await publish_kick_progress({
+                "jobId": job_id, "phase": "progress",
+                "totalJobs": total_jobs, "dispatchedJobs": current_total,
+                "failedJobs": current_failed,
+                "websockets": len(sockets),
+                "loop": loop_no + 1, "loops": loops,
+                "target": current_target, "websocket": ws_name,
+                "replacement": bool(is_replacement),
+                "kickedTargets": len(state["kicked"]),
+                "socketStats": {"websocket": ws_name, **current_socket},
+            })
+
+            # Replacement is event-driven from mark_confirmed_kick(). Do not
+            # guess that a target was kicked merely because send_kick succeeded.
+            return
 
     for loop_no in range(loops):
         if combo in combo_bursts:
@@ -361,19 +514,37 @@ async def kick_loop(request):
         if loop_no + 1 < loops and delay_batch:
             await asyncio.sleep(delay_batch)
 
+    # Wait for replacement chains already triggered by confirmed events. A
+    # replacement may itself be kicked and therefore schedule another one.
+    while replacement_state.get("replacement_tasks"):
+        pending = list(replacement_state["replacement_tasks"])
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    active_jobs = ACTIVE_KICK_JOBS.get(room_key, [])
+    if replacement_state in active_jobs:
+        active_jobs.remove(replacement_state)
+    if not active_jobs:
+        ACTIVE_KICK_JOBS.pop(room_key, None)
+
     reports = socket_reports()
     await publish_kick_progress({
         "jobId": job_id, "phase": "done", "totalJobs": total_jobs,
         "dispatchedJobs": total, "failedJobs": failed,
         "websockets": len(sockets), "targets": len(targets),
-        "loop": loops, "burst": burst, "combo": combo, "kickLimit": "100/socket/second",
+        "loop": loops, "burst": burst, "combo": combo,
+        "replacement": True, "kickedTargets": len(replacement_state["kicked"]),
+        "replacementDispatched": replacement_state["replacement_dispatched"],
+        "kickLimit": KICK_LIMIT_LABEL,
         "socketReports": reports
     })
     return web.json_response({"ok": True, "jobId": job_id, "totalJobs": total_jobs,
                               "dispatchedJobs": total, "failedJobs": failed,
                               "websockets": len(sockets), "targets": len(targets),
                               "loop": loops, "burst": burst, "combo": combo,
-                              "kickLimit": "100/socket/second", "socketReports": reports})
+                              "replacement": True, "kickedTargets": len(replacement_state["kicked"]),
+                              "replacementDispatched": replacement_state["replacement_dispatched"],
+                              "kickLimit": KICK_LIMIT_LABEL, "socketReports": reports})
 
 async def suicide(request):
     try:
@@ -395,7 +566,7 @@ async def suicide(request):
     jobs = [send_kick(ws, room, target) for ws in sockets]
     results = await asyncio.gather(*jobs, return_exceptions=True)
     sent = sum(1 for x in results if x is True)
-    return web.json_response({"ok": True, "websockets": sent, "target": target, "kickLimit": "100/socket/second"})
+    return web.json_response({"ok": True, "websockets": sent, "target": target, "kickLimit": KICK_LIMIT_LABEL})
 
 async def index(request):
     return web.FileResponse(ROOT / "index.html")
@@ -440,6 +611,18 @@ async def proxy(request):
         async def upstream_to_browser():
             async for msg in upstream:
                 if msg.type == WSMsgType.TEXT:
+                    try:
+                        payload = __import__("json").loads(msg.data)
+                        confirmed = await mark_confirmed_kick(payload)
+                        if confirmed:
+                            await browser.send_json({
+                                "type": "kick.target.confirmed",
+                                "room": confirmed["room"],
+                                "target_username": confirmed["target"],
+                                "source_type": confirmed["type"],
+                            })
+                    except Exception:
+                        pass
                     await browser.send_str(msg.data)
                 elif msg.type == WSMsgType.BINARY:
                     await browser.send_bytes(msg.data)
@@ -512,8 +695,6 @@ app.router.add_get("/health", health)
 app.router.add_get("/ws", proxy)
 app.router.add_post("/api/kick-loop", kick_loop)
 app.router.add_post("/api/sandbox-kick", sandbox_kick)
-app.router.add_post("/api/config/save", save_config_file)
-app.router.add_get("/api/config/load", load_config_file)
 app.router.add_post("/api/suicide", suicide)
 app.router.add_static("/static/", ROOT)
 
