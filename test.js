@@ -19,6 +19,8 @@ const SAVE_PREFIX="migsock_config_";
 let participantUsers=[];
 const participantBySocket=Array.from({length:N},()=>[]);
 let autoTargetLocked=false;
+let autoTargetTimer=null;
+let autoTargetCycle=0;
 const COUNTDOWN_DEFAULT=60000;
 let countdownDeadline=0;
 let countdownTimer=null;
@@ -158,14 +160,31 @@ function targetHas(username){
 }
 function removeConfirmedKickedTarget(username){
   username=String(username||"").trim();
-  if(username)confirmedKickedTargets.add(username.toLowerCase());
-  if(!username)return;
-  const match=[...targetList.querySelectorAll(".target-item")].find(o=>String(o.dataset.username||"").toLowerCase()===username.toLowerCase());
-  if(!match)return;
-  match.remove();
+  if(!username)return false;
+  const key=username.toLowerCase();
+  confirmedKickedTargets.add(key);
+
+  [...targetList.querySelectorAll(".target-item")]
+    .filter(o=>String(o.dataset.username||"").trim().toLowerCase()===key)
+    .forEach(o=>o.remove());
+
+  participantUsers=(participantUsers||[]).filter(u=>String(u||"").trim().toLowerCase()!==key);
+  if(Array.isArray(participantBySocket)){
+    for(let i=0;i<participantBySocket.length;i++){
+      const list=Array.isArray(participantBySocket[i])?participantBySocket[i]:[];
+      participantBySocket[i]=list.filter(u=>String(u||"").trim().toLowerCase()!==key);
+    }
+  }
+
+  [...userList.querySelectorAll(".user-item")].forEach(row=>{
+    const label=row.querySelector("span");
+    if(label && label.textContent.trim().toLowerCase()===key)row.remove();
+  });
+
   updateTargetCount();
-  if(Array.isArray(participantUsers) && participantUsers.length) showUsers(participantUsers,false);
-  log(0,`TARGET dihapus otomatis: ${username} sudah kicked — target tidak akan diproses lagi`);
+  userCount.textContent=String(userList.querySelectorAll(".user-item").length);
+  log(0,`KICKED: ${username} dihapus dari USER dan TARGET`);
+  return true;
 }
 function addTarget(username){
   const value=String(username||"").trim();
@@ -204,33 +223,43 @@ function autoAddMatchingTargets(users){
     .map(u=>[u.toLowerCase(),u])).values()]
     .filter(u=>!blockedWsUsers.has(u.toLowerCase())&&!confirmedKickedTargets.has(u.toLowerCase()));
 
-  // A pattern is a family with the same prefix/suffix and a numbered or
-  // alphabetic sequence in the middle/end. Plain base names are deliberately
-  // not mixed with their numbered variants.
+  /*
+   * Auto Target v2:
+   * - only compares usernames inside the same prefix/suffix family;
+   * - numeric and alphabetic sequences are handled separately;
+   * - a family containing 10 members is strongly preferred;
+   * - when a family has >10 members, choose the tightest 10-number window;
+   * - when exactly 10 similar members exist but they are not perfectly
+   *   consecutive, they are still accepted instead of being ignored;
+   * - plain base names are never mixed with numbered variants;
+   * - WS1..WS10 usernames and already-kicked users are always excluded.
+   */
   const numericGroups=new Map();
   const alphaGroups=new Map();
-  const add=(map,key,item)=>{if(!map.has(key))map.set(key,[]);map.get(key).push(item)};
+  const add=(map,key,item)=>{
+    if(!map.has(key))map.set(key,[]);
+    map.get(key).push(item);
+  };
 
   for(const u of list){
     let m=u.match(/^(.*?)(\d+)(.*?)$/);
     if(m){
       add(numericGroups,`${m[1].toLowerCase()}|${m[3].toLowerCase()}`,{
-        u,n:Number(m[2]),raw:m[2],width:m[2].length,prefix:m[1],suffix:m[3]
+        u,n:Number(m[2]),raw:m[2],width:m[2].length
       });
       continue;
     }
     m=u.match(/^(.*?)([A-Za-z])$/);
     if(m){
-      add(alphaGroups,m[1].toLowerCase(),{u,ch:m[2].toLowerCase(),code:m[2].toLowerCase().charCodeAt(0),prefix:m[1]});
+      add(alphaGroups,m[1].toLowerCase(),{
+        u,ch:m[2].toLowerCase(),code:m[2].toLowerCase().charCodeAt(0)
+      });
     }
   }
 
   const candidates=[];
 
-  // Numeric patterns: use a sliding window of at most 10 consecutive numbers.
-  // This handles target.00-target.99, target.01-target.99, manda01-manda10,
-  // and prefixes/suffixes such as name01.man without treating plain `name`
-  // as part of the numbered pattern.
+  // Numeric families.
   for(const [key,rawItems] of numericGroups){
     const byNumber=new Map();
     for(const x of rawItems){
@@ -240,85 +269,159 @@ function autoAddMatchingTargets(users){
     const items=[...byNumber.values()].sort((a,b)=>a.n-b.n||a.u.localeCompare(b.u));
     if(items.length<2)continue;
 
-    let best=null;
-    for(let i=0;i<items.length;i++){
-      const window=[];
-      for(let j=i;j<items.length && items[j].n-items[i].n<10;j++)window.push(items[j]);
-      if(!window.length)continue;
-      let contiguous=1;
-      for(let k=1;k<window.length;k++){
-        if(window[k].n===window[k-1].n+1)contiguous++;
-        else break;
-      }
-      const sameWidth=window.filter(x=>x.width===window[0].width).length;
-      const score={count:window.length,contiguous,start:window[0].n,sameWidth,width:window[0].width};
-      if(!best || score.contiguous>best.score.contiguous ||
-        (score.contiguous===best.score.contiguous && score.count>best.score.count) ||
-        (score.contiguous===best.score.contiguous && score.count===best.score.count && score.sameWidth>best.score.sameWidth) ||
-        (score.contiguous===best.score.contiguous && score.count===best.score.count && score.sameWidth===best.score.sameWidth && score.start<best.score.start)){
-        best={window,score};
-      }
-    }
-    if(!best)continue;
+    // Find the densest 10-member window. For exactly 10 members, keep the
+    // whole family even if a number is missing from the sequence.
+    let bestWindow=null;
+    let bestScore=null;
 
-    const selected=best.window.slice(0,10);
-    // A full 10-member contiguous sequence is the strongest numeric pattern.
-    // If fewer than 10 exist in the best window, do not fill it with unrelated
-    // numbers: the remaining slots stay available for manual checkbox target.
-    const contiguousCount=Math.min(best.score.contiguous,10);
+    if(items.length>=10){
+      for(let i=0;i<=items.length-10;i++){
+        const window=items.slice(i,i+10);
+        let contiguous=1;
+        for(let k=1;k<window.length;k++){
+          if(window[k].n===window[k-1].n+1)contiguous++;
+          else break;
+        }
+        let run=1, maxRun=1;
+        for(let k=1;k<window.length;k++){
+          if(window[k].n===window[k-1].n+1)run++;
+          else run=1;
+          if(run>maxRun)maxRun=run;
+        }
+        const span=window[9].n-window[0].n;
+        const sameWidth=window.filter(x=>x.width===window[0].width).length;
+        const score={
+          full:10,
+          contiguous,
+          maxRun,
+          span,
+          sameWidth,
+          start:window[0].n
+        };
+        if(!bestScore ||
+          score.contiguous>bestScore.contiguous ||
+          (score.contiguous===bestScore.contiguous && score.maxRun>bestScore.maxRun) ||
+          (score.contiguous===bestScore.contiguous && score.maxRun===bestScore.maxRun && score.span<bestScore.span) ||
+          (score.contiguous===bestScore.contiguous && score.maxRun===bestScore.maxRun && score.span===bestScore.span && score.sameWidth>bestScore.sameWidth) ||
+          (score.contiguous===bestScore.contiguous && score.maxRun===bestScore.maxRun && score.span===bestScore.span && score.sameWidth===bestScore.sameWidth && score.start<bestScore.start)){
+          bestWindow=window;
+          bestScore=score;
+        }
+      }
+    }else{
+      // Keep the previous useful behaviour for smaller families: they are
+      // candidates only when there is a genuine consecutive sequence.
+      for(let i=0;i<items.length;i++){
+        let run=[items[i]];
+        for(let j=i+1;j<items.length;j++){
+          if(items[j].n===run[run.length-1].n+1)run.push(items[j]);
+          else break;
+        }
+        if(run.length>=2 && (!bestWindow || run.length>bestWindow.length ||
+          (run.length===bestWindow.length && run[0].n<bestWindow[0].n))){
+          bestWindow=run;
+        }
+      }
+      if(bestWindow)bestScore={
+        full:bestWindow.length,
+        contiguous:bestWindow.length,
+        maxRun:bestWindow.length,
+        span:bestWindow[bestWindow.length-1].n-bestWindow[0].n,
+        sameWidth:bestWindow.filter(x=>x.width===bestWindow[0].width).length,
+        start:bestWindow[0].n
+      };
+    }
+
+    if(!bestWindow||bestWindow.length<2)continue;
+    const selected=bestWindow.slice(0,10);
     candidates.push({
-      items:selected.slice(0,contiguousCount),
-      score:3000 + contiguousCount*100 + Math.min(best.score.count,10)*10 + best.score.sameWidth - Math.min(best.score.start,999999)/1000000,
+      items:selected,
+      score:400000 +
+        (selected.length===10?100000:0) +
+        selected.length*1000 +
+        bestScore.contiguous*100 +
+        bestScore.maxRun*50 -
+        Math.min(bestScore.span,9999) -
+        Math.min(bestScore.start,999999)/1000000,
       type:'num',
-      start:best.score.start,
+      start:bestScore.start,
       key
     });
   }
 
-  // Alphabetic patterns: find the best contiguous run/window, e.g.
-  // abcd.a-abcd.j. Do not simply sort and take the first 10 letters.
+  // Alphabetic families such as abcd.a ... abcd.j.
   for(const [key,rawItems] of alphaGroups){
     const byCode=new Map();
-    for(const x of rawItems){
-      if(!byCode.has(x.code))byCode.set(x.code,x);
-    }
+    for(const x of rawItems)if(!byCode.has(x.code))byCode.set(x.code,x);
     const items=[...byCode.values()].sort((a,b)=>a.code-b.code||a.u.localeCompare(b.u));
     if(items.length<2)continue;
 
-    let best=null;
-    for(let i=0;i<items.length;i++){
-      const window=[];
-      for(let j=i;j<items.length && items[j].code-items[i].code<10;j++)window.push(items[j]);
-      let contiguous=window.length?1:0;
-      for(let k=1;k<window.length;k++){
-        if(window[k].code===window[k-1].code+1)contiguous++;
-        else break;
+    let bestWindow=null,bestScore=null;
+    if(items.length>=10){
+      for(let i=0;i<=items.length-10;i++){
+        const window=items.slice(i,i+10);
+        let maxRun=1,run=1;
+        for(let k=1;k<window.length;k++){
+          if(window[k].code===window[k-1].code+1)run++;
+          else run=1;
+          if(run>maxRun)maxRun=run;
+        }
+        const span=window[9].code-window[0].code;
+        const score={contiguous:maxRun,span,start:window[0].code};
+        if(!bestScore||score.contiguous>bestScore.contiguous||
+          (score.contiguous===bestScore.contiguous&&score.span<bestScore.span)||
+          (score.contiguous===bestScore.contiguous&&score.span===bestScore.span&&score.start<bestScore.start)){
+          bestWindow=window;bestScore=score;
+        }
       }
-      const score={count:window.length,contiguous,start:window[0]?.code||999,sameCase:window.filter(x=>x.ch===window[0]?.ch).length};
-      if(!best || score.contiguous>best.score.contiguous ||
-        (score.contiguous===best.score.contiguous && score.count>best.score.count) ||
-        (score.contiguous===best.score.contiguous && score.count===best.score.count && score.start<best.score.start))best={window,score};
+    }else{
+      for(let i=0;i<items.length;i++){
+        let run=[items[i]];
+        for(let j=i+1;j<items.length;j++){
+          if(items[j].code===run[run.length-1].code+1)run.push(items[j]);
+          else break;
+        }
+        if(run.length>=2&&(!bestWindow||run.length>bestWindow.length||
+          (run.length===bestWindow.length&&run[0].code<bestWindow[0].code)))bestWindow=run;
+      }
+      if(bestWindow)bestScore={
+        contiguous:bestWindow.length,
+        span:bestWindow[bestWindow.length-1].code-bestWindow[0].code,
+        start:bestWindow[0].code
+      };
     }
-    if(!best || best.score.contiguous<2)continue;
-    const selected=best.window.slice(0,10);
-    candidates.push({items:selected,score:2000+selected.length*100+Math.min(best.score.count,10)*10-best.score.start/100000,type:'alpha',start:best.score.start,key});
+
+    if(!bestWindow||bestWindow.length<2)continue;
+    candidates.push({
+      items:bestWindow.slice(0,10),
+      score:300000 +
+        (bestWindow.length===10?100000:0) +
+        bestWindow.length*1000 +
+        bestScore.contiguous*100 -
+        bestScore.span -
+        bestScore.start/100000,
+      type:'alpha',
+      start:bestScore.start,
+      key
+    });
   }
 
-  // Numeric sequence always has priority over alphabetic sequence when both
-  // have comparable length. Within the same type, longest contiguous run wins;
-  // ties prefer the earliest sequence. This makes target.00-target.09 beat
-  // target.01-target.10 when both are available.
   candidates.sort((a,b)=>b.score-a.score);
   const best=candidates[0];
   if(!best)return [];
 
   const capacity=Math.max(0,10-targetList.querySelectorAll('.target-item').length);
   if(!capacity)return [];
+
   const added=[];
-  for(const x of best.items.slice(0,capacity))if(addTarget(x.u))added.push(x.u);
+  for(const x of best.items.slice(0,capacity)){
+    if(addTarget(x.u))added.push(x.u);
+  }
   return added;
 }
 function clearTargets(){
+  if(autoTargetTimer){clearTimeout(autoTargetTimer);autoTargetTimer=null}
+  autoTargetCycle++;
   const restored=[...new Set(participantUsers)].filter(u=>!confirmedKickedTargets.has(String(u).toLowerCase()));
   targetList.innerHTML="";
   autoTargetLocked=false;
@@ -378,11 +481,10 @@ function showUsers(users,auto=true){
   // Auto Target is intentionally locked after the first successful selection
   // for the current List User cycle. Later WS participant responses only
   // refresh the User list and cannot replace the chosen pattern.
-  const autoTargets=(!autoTargetLocked&&auto)?autoAddMatchingTargets(uniq):[];
-  if(autoTargets.length){
-    autoTargetLocked=true;
-    log(0,`AUTO TARGET: ${autoTargets.join(", ")}`);
-  }
+  // Participant responses can arrive from WS1..WS10 at different times.
+  // Auto Target is scheduled by handleParticipants after the merged snapshot
+  // has had time to settle, so an early partial response cannot lock the
+  // wrong pattern.
 
   const visible=uniq.filter(u=>!targetHas(u)&&!confirmedKickedTargets.has(u.toLowerCase()));
   if(!visible.length){
@@ -401,12 +503,35 @@ function showUsers(users,auto=true){
   userCount.textContent=visible.length;
   updateTargetCount();
 }
+function scheduleAutoTarget(merged,cycle){
+  if(autoTargetLocked||!merged||!merged.length)return;
+  if(autoTargetTimer)clearTimeout(autoTargetTimer);
+
+  // Wait for a quiet period after the latest WS participant response.
+  // This prevents WS1 returning first from locking a partial 2/3-member
+  // pattern before WS2..WS10 have contributed their usernames.
+  autoTargetTimer=setTimeout(()=>{
+    if(cycle!==autoTargetCycle||autoTargetLocked)return;
+    const current=[...new Map(participantBySocket.flat()
+      .map(x=>String(x||'').trim())
+      .filter(Boolean)
+      .map(u=>[u.toLowerCase(),u])).values()];
+    const autoTargets=autoAddMatchingTargets(current);
+    if(autoTargets.length){
+      autoTargetLocked=true;
+      log(0,`AUTO TARGET: ${autoTargets.join(", ")}`);
+      showUsers(current,false);
+    }
+  },700);
+}
 function listUser(){
   const room=getRoom();if(!room)return;
+  if(autoTargetTimer){clearTimeout(autoTargetTimer);autoTargetTimer=null}
   targetList.innerHTML="";
   userList.innerHTML="";
   userCount.textContent="0";
   autoTargetLocked=false;
+  autoTargetCycle++;
   participantUsers=[];
   for(let i=0;i<N;i++)participantBySocket[i]=[];
   updateTargetCount();
@@ -424,7 +549,8 @@ function handleParticipants(m,i){
     .map(x=>String(x||'').trim())
     .filter(Boolean)
     .map(u=>[u.toLowerCase(),u])).values()];
-  showUsers(merged);
+  showUsers(merged,false);
+  scheduleAutoTarget(merged,autoTargetCycle);
   log(i,`LISTROOM: WS${i+1} ${users.length} user | gabungan ${merged.length}`);
   return true;
 }
